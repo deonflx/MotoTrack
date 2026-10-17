@@ -238,55 +238,85 @@ def _compute_refuel_point_and_pumps(starting_point, destination_point, capacity,
     refuel_point = route_line.interpolate_normalized(fraction)
     refuel_lng, refuel_lat = refuel_point.x, refuel_point.y
 
-    print(f"[Refuel Point] At {refuel_target_km:.1f} km → "
+    print(f"[Refuel Point] At {refuel_target_km:.1f} km -> "
           f"({refuel_lat:.5f}, {refuel_lng:.5f})")
 
-    # ── Step 4: Query Overpass API with expanding radius ─────────────────
+    # ── Step 4: Search for fuel stations with expanding radius (2 km to 100 km) ───
     stations = []
-    search_radii_km = [2, 5, 10, 20, 50]
+    search_radii_km = [2, 5, 10, 20, 35, 50, 75, 100]
     used_radius_km = search_radii_km[0]
 
     for radius_km in search_radii_km:
+        used_radius_km = radius_km
+        candidates = []
+
+        # 4a. Query Overpass API (OpenStreetMap)
         try:
             radius_m = radius_km * 1000
             overpass_query = f"""
-            [out:json];
+            [out:json][timeout:6];
             node["amenity"="fuel"](around:{radius_m},{refuel_lat},{refuel_lng});
             out body;
             """
             r = http_requests.post(
                 'https://overpass-api.de/api/interpreter',
                 data={'data': overpass_query},
-                timeout=8.0
+                headers={'User-Agent': 'BikeTripRoutingApp/1.0 (contact: admin@bikerouteapp.com)'},
+                timeout=4.0
             )
-            elements = r.json().get('elements', [])
-
-            for elem in elements:
-                tags = elem.get('tags', {})
-                pump_lat = elem.get('lat')
-                pump_lng = elem.get('lon')
-                dist_km = _haversine_km(refuel_lat, refuel_lng, pump_lat, pump_lng)
-                stations.append({
-                    'name':     tags.get('name', 'Fuel Station'),
-                    'brand':    tags.get('brand', 'Unknown'),
-                    'lat':      pump_lat,
-                    'lng':      pump_lng,
-                    'distance_km': round(dist_km, 2),
-                })
-
-            stations.sort(key=lambda s: s['distance_km'])
-            used_radius_km = radius_km
-            print(f"[Overpass] Radius {radius_km} km → "
-                  f"found {len(stations)} fuel stations")
-
-            if stations:
-                break  # Found stations, stop expanding
-
-            print(f"[Overpass] No stations at {radius_km} km, expanding…")
+            if r.status_code == 200:
+                elements = r.json().get('elements', [])
+                for elem in elements:
+                    tags = elem.get('tags', {})
+                    pump_lat = elem.get('lat')
+                    pump_lng = elem.get('lon')
+                    dist_km = _haversine_km(refuel_lat, refuel_lng, pump_lat, pump_lng)
+                    candidates.append({
+                        'name':     tags.get('name') or tags.get('operator') or 'Fuel Station',
+                        'brand':    tags.get('brand') or tags.get('operator') or 'Petrol Pump',
+                        'lat':      pump_lat,
+                        'lng':      pump_lng,
+                        'distance_km': round(dist_km, 2),
+                    })
         except Exception as e:
-            print(f"[Overpass] Petrol pump lookup failed at {radius_km} km: {e}")
-            used_radius_km = radius_km
-            break  # Don't retry on network/API errors
+            print(f"[Fuel Search] Overpass lookup at {radius_km} km note: {e}")
+
+        # 4b. Fallback to Nominatim if Overpass returned no results or timed out
+        if not candidates:
+            try:
+                d_lat = radius_km / 111.0
+                d_lng = radius_km / (111.0 * math.cos(math.radians(refuel_lat)))
+                viewbox = f"{refuel_lng - d_lng},{refuel_lat + d_lat},{refuel_lng + d_lng},{refuel_lat - d_lat}"
+                r = http_requests.get(
+                    'https://nominatim.openstreetmap.org/search',
+                    params={'q': 'fuel', 'format': 'json', 'limit': 10, 'bounded': 1, 'viewbox': viewbox},
+                    headers={'User-Agent': 'BikeTripRoutingApp/1.0 (contact: admin@bikerouteapp.com)'},
+                    timeout=4.0
+                )
+                if r.status_code == 200:
+                    for it in r.json():
+                        pump_lat = float(it.get('lat'))
+                        pump_lng = float(it.get('lon'))
+                        dist_km = _haversine_km(refuel_lat, refuel_lng, pump_lat, pump_lng)
+                        if dist_km <= radius_km:
+                            name = it.get('name') or it.get('display_name', '').split(',')[0].strip() or 'Fuel Station'
+                            candidates.append({
+                                'name':        name,
+                                'brand':       it.get('type') or 'Petrol Pump',
+                                'lat':         pump_lat,
+                                'lng':         pump_lng,
+                                'distance_km': round(dist_km, 2),
+                            })
+            except Exception as e:
+                print(f"[Fuel Search] Nominatim lookup at {radius_km} km note: {e}")
+
+        if candidates:
+            candidates.sort(key=lambda s: s['distance_km'])
+            stations = candidates
+            print(f"[Fuel Search] Found {len(stations)} fuel stations at radius {radius_km} km")
+            break
+        else:
+            print(f"[Fuel Search] No stations found within {radius_km} km, expanding search radius...")
 
     return {
         'needed': True,
