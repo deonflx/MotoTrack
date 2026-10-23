@@ -5,11 +5,11 @@ services:
     image: postgis/postgis:latest
     container_name: postgis-db
     environment:
-      POSTGRES_DB: gisdb
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: 9f324689154c4a17b3b2151126d073e4
+      POSTGRES_DB: ${DB_NAME:-gisdb}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
     ports:
-      - "5433:5432"   # 5433 avoids conflict with local PostgreSQL on 5432
+      - "127.0.0.1:${DB_PORT:-5433}:5432"   # Bound to localhost to prevent public exposure
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:

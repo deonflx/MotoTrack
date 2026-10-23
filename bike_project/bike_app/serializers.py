@@ -1,5 +1,6 @@
 from rest_framework import serializers
 from django.contrib.gis.geos import Point
+from django.db.models import Q
 from bike_app.models import BikeTrip, TripSession, RouteWeather, ConnectionRequest
 
 
@@ -118,7 +119,6 @@ class TripSessionSerializer(serializers.ModelSerializer):
 
     def get_convoy(self, obj):
         from .services import _haversine_km
-        from django.db.models import Q
 
         if not obj.bike_trip:
             return None
@@ -139,7 +139,7 @@ class TripSessionSerializer(serializers.ModelSerializer):
                 status=ConnectionRequest.STATUS_ACCEPTED
             ).select_related('sender', 'receiver', 'bike_trip'))
 
-        all_conns = trip_conns + user_conns
+        all_conns = list({c.pk: c for c in (trip_conns + user_conns)}.values())
         if not all_conns:
             return None
 
@@ -264,6 +264,33 @@ class TripSessionSerializer(serializers.ModelSerializer):
 
         return super().update(instance, validated_data)
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get('request')
+        user = request.user if (request and request.user and request.user.is_authenticated) else None
+
+        trip_user_id = instance.bike_trip.user_id if instance.bike_trip else None
+        is_owner = bool(user and trip_user_id and trip_user_id == user.id)
+        is_staff = bool(user and user.is_staff)
+        is_accepted_rider = False
+
+        if user and instance.bike_trip_id:
+            is_accepted_rider = ConnectionRequest.objects.filter(
+                bike_trip_id=instance.bike_trip_id,
+                status=ConnectionRequest.STATUS_ACCEPTED,
+            ).filter(Q(sender_id=user.id) | Q(receiver_id=user.id)).exists()
+
+        if not (is_owner or is_staff or is_accepted_rider):
+            # Limit live-location visibility: redact live GPS coordinates, route geometry, and convoy details
+            data['current_lat'] = None
+            data['current_lng'] = None
+            data['start_coords'] = None
+            data['dest_coords'] = None
+            data['route_coords'] = []
+            data['convoy'] = None
+
+        return data
+
 
 # ─── 3. Connection Request Serializer (Group Rides) ───────────────────────────
 class ConnectionRequestSerializer(serializers.ModelSerializer):
@@ -277,7 +304,7 @@ class ConnectionRequestSerializer(serializers.ModelSerializer):
 
     starting_name = serializers.ReadOnlyField(source='bike_trip.starting_name')
     destination_name = serializers.ReadOnlyField(source='bike_trip.destination_name')
-    whatsapp_group_link = serializers.ReadOnlyField(source='bike_trip.whatsapp_group_link')
+    whatsapp_group_link = serializers.SerializerMethodField()
     is_sender = serializers.SerializerMethodField()
     is_receiver = serializers.SerializerMethodField()
 
@@ -300,7 +327,7 @@ class ConnectionRequestSerializer(serializers.ModelSerializer):
             'created_at',
             'updated_at',
         ]
-        read_only_fields = ['id', 'sender', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'sender', 'status', 'created_at', 'updated_at']
 
     def get_is_sender(self, obj):
         request = self.context.get('request')
@@ -313,6 +340,17 @@ class ConnectionRequestSerializer(serializers.ModelSerializer):
         if not request or not request.user or not request.user.is_authenticated:
             return False
         return bool(obj.receiver_id and obj.receiver_id == request.user.id)
+
+    def get_whatsapp_group_link(self, obj):
+        request = self.context.get('request')
+        if not request or not request.user or not request.user.is_authenticated:
+            return None
+        if request.user.is_staff or obj.bike_trip.user_id == request.user.id:
+            return obj.bike_trip.whatsapp_group_link
+        is_participant = request.user.id in (obj.sender_id, obj.receiver_id)
+        if obj.status == ConnectionRequest.STATUS_ACCEPTED and is_participant:
+            return obj.bike_trip.whatsapp_group_link
+        return None
 
 
 # ─── 4. Main Bike Trip Serializer ─────────────────────────────────────────────
@@ -353,6 +391,25 @@ class BikeTripSerializer(serializers.ModelSerializer):
         if not request or not request.user or not request.user.is_authenticated:
             return False
         return bool(obj.user_id and obj.user_id == request.user.id)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get('request')
+        user = request.user if (request and request.user and request.user.is_authenticated) else None
+
+        is_owner = bool(user and instance.user_id and instance.user_id == user.id)
+        is_staff = bool(user and user.is_staff)
+        is_accepted_rider = False
+        if user and instance.pk:
+            is_accepted_rider = ConnectionRequest.objects.filter(
+                bike_trip_id=instance.pk,
+                status=ConnectionRequest.STATUS_ACCEPTED,
+            ).filter(Q(sender_id=user.id) | Q(receiver_id=user.id)).exists()
+
+        if not (is_owner or is_staff or is_accepted_rider):
+            data['whatsapp_group_link'] = None
+
+        return data
 
     def get_starting_coords(self, obj):
         if obj.starting_point:
