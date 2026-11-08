@@ -1,5 +1,6 @@
 import time
 import datetime
+import markdown
 from django.utils import timezone
 from django.db import transaction
 from rest_framework import viewsets, permissions, status, exceptions
@@ -288,7 +289,6 @@ Provide a detailed advisory covering:
 2. Total trip time with a break schedule
 3. Route & safety advice given the weather
 """
-            import markdown
             response_text = generate_content(prompt)
             html = markdown.markdown(response_text)
             save_ai_tips(trip.pk, html)
@@ -469,8 +469,8 @@ class TripSessionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_403_FORBIDDEN
             )
 
+        link = request.data.get('whatsapp_group_link', '').strip()
         if session.bike_trip:
-            link = request.data.get('whatsapp_group_link', '').strip()
             if link and not link.startswith('https://chat.whatsapp.com/'):
                 return Response(
                     {'error': 'WhatsApp link must be a valid https://chat.whatsapp.com/ invite URL.'},

@@ -1,5 +1,4 @@
 from django.db import migrations
-import redis
 import logging
 
 logger = logging.getLogger(__name__)
@@ -11,6 +10,7 @@ def backfill_specs_from_redis_or_defaults(apps, schema_editor):
 
     r = None
     try:
+        import redis
         redis_url = getattr(settings, 'REDIS_URL', 'redis://localhost:6379')
         r = redis.from_url(redis_url, decode_responses=True, socket_connect_timeout=2)
         r.ping()
@@ -21,7 +21,6 @@ def backfill_specs_from_redis_or_defaults(apps, schema_editor):
     trips_to_backfill = BikeTrip.objects.filter(capacity__isnull=True) | BikeTrip.objects.filter(mileage__isnull=True)
 
     for trip in trips_to_backfill.distinct():
-        updated = False
         capacity_val = trip.capacity
         mileage_val = trip.mileage
 

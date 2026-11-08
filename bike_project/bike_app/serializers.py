@@ -169,30 +169,40 @@ class TripSessionSerializer(serializers.ModelSerializer):
         if not partner_users:
             return None
 
+        # Pre-fetch all active partner sessions in a single query (avoid N+1)
+        active_sessions = list(
+            TripSession.objects.filter(
+                bike_trip__user_id__in=partner_users.keys(),
+                status=TripSession.STATUS_ACTIVE
+            ).exclude(pk=obj.pk).select_related('bike_trip')
+        )
+        partner_session_map = {}
+        for s in active_sessions:
+            if s.bike_trip and s.bike_trip.user_id:
+                # Prefer session associated with linked_trip_ids if multiple exist
+                if s.bike_trip.user_id not in partner_session_map or s.bike_trip_id in linked_trip_ids:
+                    partner_session_map[s.bike_trip.user_id] = s
+
+        # Pre-fetch fallback bike trips for partners without an active session
+        missing_user_ids = [uid for uid in partner_users if uid not in partner_session_map]
+        user_trips_map = {}
+        if missing_user_ids:
+            for t in BikeTrip.objects.filter(user_id__in=missing_user_ids).order_by('created_at'):
+                user_trips_map[t.user_id] = t
+
         members = []
         current_lat = obj.current_lat
         current_lng = obj.current_lng
 
         for p_id, partner in partner_users.items():
-            # Find an active session for this partner
-            partner_session = TripSession.objects.filter(
-                bike_trip__user=partner,
-                status=TripSession.STATUS_ACTIVE
-            ).exclude(pk=obj.pk).select_related('bike_trip').first()
-
-            if not partner_session:
-                partner_session = TripSession.objects.filter(
-                    bike_trip_id__in=linked_trip_ids,
-                    bike_trip__user=partner,
-                    status=TripSession.STATUS_ACTIVE
-                ).exclude(pk=obj.pk).select_related('bike_trip').first()
+            partner_session = partner_session_map.get(p_id)
 
             # Bike name
             bikename = None
             if partner_session and partner_session.bike_trip:
                 bikename = partner_session.bike_trip.bikename
             else:
-                p_trip = BikeTrip.objects.filter(user=partner).first()
+                p_trip = user_trips_map.get(p_id)
                 bikename = p_trip.bikename if p_trip else 'Motorcycle'
 
             p_lat = partner_session.current_lat if partner_session else None
@@ -345,11 +355,14 @@ class ConnectionRequestSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         if not request or not request.user or not request.user.is_authenticated:
             return None
-        if request.user.is_staff or obj.bike_trip.user_id == request.user.id:
-            return obj.bike_trip.whatsapp_group_link
+        trip = obj.bike_trip
+        if not trip:
+            return None
+        if request.user.is_staff or trip.user_id == request.user.id:
+            return trip.whatsapp_group_link
         is_participant = request.user.id in (obj.sender_id, obj.receiver_id)
         if obj.status == ConnectionRequest.STATUS_ACCEPTED and is_participant:
-            return obj.bike_trip.whatsapp_group_link
+            return trip.whatsapp_group_link
         return None
 
 
