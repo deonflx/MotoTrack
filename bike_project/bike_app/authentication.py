@@ -37,28 +37,25 @@ class ClerkAuthentication(authentication.BaseAuthentication):
             unverified_header = jwt.get_unverified_header(token)
             unverified_payload = jwt.decode(token, options={"verify_signature": False})
 
-            # 2. Determine JWKS URL and validate issuer
-            jwks_url = getattr(settings, 'CLERK_JWKS_URL', None) or os.environ.get('CLERK_JWKS_URL')
+            # 2. Determine trusted issuer, JWKS URL, and validate issuer
             configured_issuer = getattr(settings, 'CLERK_ISSUER', None) or os.environ.get('CLERK_ISSUER')
+            jwks_url = getattr(settings, 'CLERK_JWKS_URL', None) or os.environ.get('CLERK_JWKS_URL')
             allowed_azp = getattr(settings, 'CLERK_ALLOWED_AZP', None) or os.environ.get('CLERK_ALLOWED_AZP')
 
-            issuer = unverified_payload.get('iss', '')
-            if not jwks_url:
-                if issuer:
-                    issuer_clean = issuer.rstrip('/')
-                    # Only allow trusted Clerk account domains or explicitly configured issuer
-                    is_valid_clerk = (
-                        issuer_clean.startswith('https://') and (
-                            issuer_clean.endswith('.clerk.accounts.dev')
-                            or issuer_clean == 'https://api.clerk.com'
-                            or (configured_issuer and issuer_clean == configured_issuer.rstrip('/'))
-                        )
-                    )
-                    if not is_valid_clerk:
-                        raise exceptions.AuthenticationFailed("Untrusted Clerk token issuer domain.")
-                    jwks_url = f"{issuer_clean}/.well-known/jwks.json"
-                else:
-                    jwks_url = "https://api.clerk.com/v1/jwks"
+            issuer = (unverified_payload.get('iss') or '').rstrip('/')
+            if configured_issuer:
+                trusted_issuer = configured_issuer.rstrip('/')
+                if issuer != trusted_issuer:
+                    raise exceptions.AuthenticationFailed(f"Token issuer does not match trusted Clerk issuer.")
+                if not jwks_url:
+                    jwks_url = f"{trusted_issuer}/.well-known/jwks.json"
+            else:
+                if not (issuer.startswith('https://') and (
+                    issuer.endswith('.clerk.accounts.dev') or issuer == 'https://api.clerk.com'
+                )):
+                    raise exceptions.AuthenticationFailed("Untrusted Clerk token issuer domain.")
+                if not jwks_url:
+                    jwks_url = f"{issuer}/.well-known/jwks.json"
 
             # 3. Retrieve signing key & verify token
             jwks_client = self.get_jwks_client(jwks_url)

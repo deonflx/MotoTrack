@@ -1,4 +1,6 @@
 from rest_framework import permissions
+from django.db.models import Q
+from .models import ConnectionRequest
 
 
 class IsOwnerOrReadOnly(permissions.BasePermission):
@@ -25,29 +27,35 @@ class IsOwnerOrReadOnly(permissions.BasePermission):
         return bool(obj.user == request.user or request.user.is_staff)
 
 
-class IsSessionOwnerOrReadOnly(permissions.BasePermission):
+class IsSessionOwnerOrAcceptedParticipant(permissions.BasePermission):
     """
     Object-level permission for TripSession:
-    - Safe methods (GET, HEAD, OPTIONS) are allowed to all users so convoy companions
-      and spectators can view live telemetry on the map.
-    - Updates (PATCH GPS coordinates, ending session, DELETE) are strictly restricted
-      to the owner of the trip associated with this session.
+    - Reads require authentication and are limited to the trip owner or a rider
+      with an accepted connection request for the trip.
+    - Writes are restricted to the trip owner (or staff).
     """
 
     def has_permission(self, request, view):
-        if request.method in permissions.SAFE_METHODS:
-            return True
         return bool(request.user and request.user.is_authenticated)
 
     def has_object_permission(self, request, view, obj):
-        if request.method in permissions.SAFE_METHODS:
-            return True
         if not request.user or not request.user.is_authenticated:
             return False
-        trip_user = obj.bike_trip.user if obj.bike_trip else None
-        if not trip_user:
-            return bool(request.user.is_staff)
-        return bool(trip_user == request.user or request.user.is_staff)
+        trip = obj.bike_trip
+        if request.user.is_staff:
+            return True
+        if not trip:
+            return False
+        if trip.user_id == request.user.id:
+            return True
+        if request.method in permissions.SAFE_METHODS:
+            return ConnectionRequest.objects.filter(
+                bike_trip_id=trip.pk,
+                status=ConnectionRequest.STATUS_ACCEPTED,
+            ).filter(
+                Q(sender_id=request.user.id) | Q(receiver_id=request.user.id)
+            ).exists()
+        return False
 
 
 class IsConnectionParticipant(permissions.BasePermission):

@@ -205,7 +205,9 @@ REST_FRAMEWORK = {
 # Clerk Authentication configuration
 CLERK_SECRET_KEY = os.environ.get('CLERK_SECRET_KEY', '')
 CLERK_PUBLISHABLE_KEY = os.environ.get('CLERK_PUBLISHABLE_KEY', '')
-CLERK_JWKS_URL = os.environ.get('CLERK_JWKS_URL', '')
+CLERK_ISSUER = os.environ.get('CLERK_ISSUER', 'https://classic-mackerel-3556.clerk.accounts.dev')
+CLERK_JWKS_URL = os.environ.get('CLERK_JWKS_URL', f"{CLERK_ISSUER.rstrip('/')}/.well-known/jwks.json" if CLERK_ISSUER else '')
+CLERK_ALLOWED_AZP = os.environ.get('CLERK_ALLOWED_AZP', '')
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",

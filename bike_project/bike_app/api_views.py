@@ -1,13 +1,12 @@
-import json
 import time
 import datetime
+import markdown
 from django.utils import timezone
 from django.db import transaction
 from rest_framework import viewsets, permissions, status, exceptions
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from django.shortcuts import get_object_or_404
-from django.contrib.gis.geos import Point, LineString
+from django.contrib.gis.geos import LineString
 from django.contrib.gis.measure import D
 from django.contrib.gis.db.models.functions import Distance
 from django.db.models import Q
@@ -22,7 +21,7 @@ from .serializers import (
 )
 from .permissions import (
     IsOwnerOrReadOnly,
-    IsSessionOwnerOrReadOnly,
+    IsSessionOwnerOrAcceptedParticipant,
     IsConnectionParticipant,
 )
 from .redis_client import (
@@ -33,6 +32,7 @@ from .redis_client import (
     delete_trip_cache,
 )
 from .ai_helper import generate_content, get_bike_specs_from_ai
+# pyrefly: ignore[missing-import]
 from .services import (
     _geocode,
     _trip_capacity_mileage,
@@ -40,7 +40,7 @@ from .services import (
     _calculate_route_overlap,
     _haversine_km,
     _fetch_and_store_weather,
-    _attach_spec_display,
+    _get_or_create_route_path,
 )
 
 User = get_user_model()
@@ -137,9 +137,26 @@ class BikeTripViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['get'])
     def fuel_stops(self, request, pk=None):
-        """Fetch pre-cached refuel points and petrol pumps from Redis"""
+        """Fetch pre-cached refuel points and petrol pumps from Redis or compute on-demand"""
         trip = self.get_object()
-        data = get_fuel_stops(trip.id)
+        force_refresh = request.query_params.get('refresh') == 'true'
+        data = None if force_refresh else get_fuel_stops(trip.id)
+
+        if not data or not data.get('total_distance_km'):
+            if trip.starting_point and trip.destination_point:
+                try:
+                    capacity, mileage = _trip_capacity_mileage(trip)
+                    data = _compute_refuel_point_and_pumps(
+                        trip.starting_point, trip.destination_point, capacity, mileage
+                    )
+                    save_fuel_stops(trip.id, data)
+                    coords = data.get('coords')
+                    if coords and len(coords) >= 2 and not trip.route_path:
+                        trip.route_path = LineString(coords, srid=4326)
+                        trip.save(update_fields=['route_path'])
+                except Exception as e:
+                    print(f"[API] Error computing fuel stops for Trip #{trip.id}: {e}")
+
         if not data:
             return Response({'needed': False, 'stations': []})
         return Response(data)
@@ -148,7 +165,7 @@ class BikeTripViewSet(viewsets.ModelViewSet):
     def start_session(self, request, pk=None):
         """Start or resume a live tracking session for this trip (owner only)"""
         trip = self.get_object()
-        if trip.user and trip.user != request.user and not request.user.is_staff:
+        if (not trip.user_id or trip.user_id != request.user.id) and not request.user.is_staff:
             return Response(
                 {'error': 'You can only start a live tracking session for your own expedition.'},
                 status=status.HTTP_403_FORBIDDEN
@@ -167,7 +184,7 @@ class BikeTripViewSet(viewsets.ModelViewSet):
     def set_whatsapp_link(self, request, pk=None):
         """Set or update the WhatsApp group link for this convoy/trip (owner only)"""
         trip = self.get_object()
-        if trip.user and trip.user != request.user and not request.user.is_staff:
+        if (not trip.user_id or trip.user_id != request.user.id) and not request.user.is_staff:
             return Response(
                 {'error': 'Only the expedition owner can set or update the WhatsApp group link.'},
                 status=status.HTTP_403_FORBIDDEN
@@ -272,7 +289,6 @@ Provide a detailed advisory covering:
 2. Total trip time with a break schedule
 3. Route & safety advice given the weather
 """
-            import markdown
             response_text = generate_content(prompt)
             html = markdown.markdown(response_text)
             save_ai_tips(trip.pk, html)
@@ -286,7 +302,10 @@ Provide a detailed advisory covering:
         trip = self.get_object()
         radius_km = 50.0
 
-        _get_or_create_route_path(trip)
+        try:
+            _get_or_create_route_path(trip)
+        except Exception as e:
+            print(f"[co_travelers] Could not ensure route_path for Trip #{trip.pk}: {e}")
         co_query = BikeTrip.objects.exclude(pk=trip.pk).select_related('user')
         dest_clean = (trip.destination_name or '').strip()
         dest_city = dest_clean.split(',')[0].strip()
@@ -377,33 +396,52 @@ Provide a detailed advisory covering:
 class TripSessionViewSet(viewsets.ModelViewSet):
     """
     Handles live tracking sessions:
-    - GET /api/sessions/<id>/ (Public / spectator telemetry read)
+    - GET /api/sessions/<id>/ (Owner or accepted convoy member)
     - PATCH /api/sessions/<id>/ with {"lat": ..., "lng": ...} (Strictly owner only)
     - POST /api/sessions/<id>/end_session/ (Owner only)
     - DELETE /api/sessions/<id>/ (Owner only)
     """
     queryset = TripSession.objects.all()
     serializer_class = TripSessionSerializer
-    permission_classes = [IsSessionOwnerOrReadOnly]
+    permission_classes = [IsSessionOwnerOrAcceptedParticipant]
+
+    def get_queryset(self):
+        queryset = TripSession.objects.select_related('bike_trip', 'bike_trip__user')
+        user = self.request.user
+        if not user or not user.is_authenticated:
+            return queryset.none()
+        if user.is_staff:
+            return queryset
+        return queryset.filter(
+            Q(bike_trip__user=user)
+            | Q(
+                bike_trip__connection_requests__status=ConnectionRequest.STATUS_ACCEPTED,
+                bike_trip__connection_requests__sender=user,
+            )
+            | Q(
+                bike_trip__connection_requests__status=ConnectionRequest.STATUS_ACCEPTED,
+                bike_trip__connection_requests__receiver=user,
+            )
+        ).distinct()
 
     def perform_create(self, serializer):
         if not self.request.user or not self.request.user.is_authenticated:
             raise exceptions.NotAuthenticated("You must be logged in to create a tracking session.")
         bike_trip = serializer.validated_data.get('bike_trip')
-        if bike_trip and bike_trip.user and bike_trip.user != self.request.user and not self.request.user.is_staff:
+        if bike_trip and bike_trip.user_id != self.request.user.id and not self.request.user.is_staff:
             raise exceptions.PermissionDenied("You can only create sessions for your own trips.")
         serializer.save()
 
     def perform_update(self, serializer):
         instance = self.get_object()
         trip_user = instance.bike_trip.user if instance.bike_trip else None
-        if trip_user and trip_user != self.request.user and not self.request.user.is_staff:
+        if (not trip_user or trip_user != self.request.user) and not self.request.user.is_staff:
             raise exceptions.PermissionDenied("You can only update GPS telemetry for your own active session.")
         serializer.save()
 
     def perform_destroy(self, instance):
         trip_user = instance.bike_trip.user if instance.bike_trip else None
-        if trip_user and trip_user != self.request.user and not self.request.user.is_staff:
+        if (not trip_user or trip_user != self.request.user) and not self.request.user.is_staff:
             raise exceptions.PermissionDenied("You can only delete your own session.")
         instance.delete()
 
@@ -411,7 +449,7 @@ class TripSessionViewSet(viewsets.ModelViewSet):
     def end_session(self, request, pk=None):
         session = self.get_object()
         trip_user = session.bike_trip.user if session.bike_trip else None
-        if trip_user and trip_user != request.user and not request.user.is_staff:
+        if (not trip_user or trip_user != request.user) and not request.user.is_staff:
             return Response(
                 {'error': 'You can only complete or end your own live session.'},
                 status=status.HTTP_403_FORBIDDEN
@@ -425,14 +463,14 @@ class TripSessionViewSet(viewsets.ModelViewSet):
     def set_whatsapp_link(self, request, pk=None):
         session = self.get_object()
         trip_user = session.bike_trip.user if session.bike_trip else None
-        if trip_user and trip_user != request.user and not request.user.is_staff:
+        if (not trip_user or trip_user != request.user) and not request.user.is_staff:
             return Response(
                 {'error': 'You can only set the WhatsApp link for your own session.'},
                 status=status.HTTP_403_FORBIDDEN
             )
 
+        link = request.data.get('whatsapp_group_link', '').strip()
         if session.bike_trip:
-            link = request.data.get('whatsapp_group_link', '').strip()
             if link and not link.startswith('https://chat.whatsapp.com/'):
                 return Response(
                     {'error': 'WhatsApp link must be a valid https://chat.whatsapp.com/ invite URL.'},
@@ -441,8 +479,10 @@ class TripSessionViewSet(viewsets.ModelViewSet):
             session.bike_trip.whatsapp_group_link = link
             session.bike_trip.save(update_fields=['whatsapp_group_link'])
 
-        serializer = self.get_serializer(session)
-        return Response(serializer.data)
+        return Response({
+            'status': 'ok',
+            'whatsapp_group_link': session.bike_trip.whatsapp_group_link if session.bike_trip else link
+        })
 
 
 class RouteWeatherViewSet(viewsets.ReadOnlyModelViewSet):
@@ -498,7 +538,11 @@ class ConnectionRequestViewSet(viewsets.ModelViewSet):
         if receiver == self.request.user:
             raise exceptions.ValidationError({'receiver': 'You cannot send a ride invitation to yourself.'})
 
-        serializer.save(sender=self.request.user, receiver=receiver)
+        serializer.save(
+            sender=self.request.user,
+            receiver=receiver,
+            status=ConnectionRequest.STATUS_PENDING
+        )
 
     def perform_update(self, serializer):
         conn = self.get_object()

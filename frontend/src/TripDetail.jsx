@@ -125,7 +125,7 @@ function TripDetail() {
 
   const fetchFuelStops = () => {
     setLoadingFuel(true);
-    api.get(`/trips/${id}/fuel_stops/`)
+    api.get(`/trips/${id}/fuel_stops/?refresh=true`)
       .then((res) => {
         setFuelData(res.data);
         setFuelLoaded(true);
@@ -583,7 +583,7 @@ function TripDetail() {
                       <span className="fuel-stat-key">Search Radius</span>
                       <span className="fuel-stat-val">{fuelData.search_radius_km} km</span>
                     </div>
-                    {fuelData.stations && fuelData.stations.length > 0 && (
+                    {fuelData.stations && fuelData.stations.length > 0 ? (
                       <div className="fuel-result">
                         <div style={{ fontSize: '0.65rem', textTransform: 'uppercase', color: 'var(--text-3)', letterSpacing: '0.08em', marginBottom: '8px' }}>
                           Overpass Petrol Stations:
@@ -597,6 +597,10 @@ function TripDetail() {
                             <span className="spec-tag" style={{ color: 'var(--jade)' }}>{st.distance_km} km</span>
                           </div>
                         ))}
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: '0.72rem', color: 'var(--text-3)', marginTop: '8px' }}>
+                        📍 Highway refueling point marked along route ({fuelData.refuel_point?.lat}, {fuelData.refuel_point?.lng}).
                       </div>
                     )}
                   </div>
