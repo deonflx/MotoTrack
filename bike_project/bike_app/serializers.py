@@ -2,7 +2,7 @@ from rest_framework import serializers
 from django.contrib.gis.geos import Point
 from django.db.models import Q
 from bike_app.models import BikeTrip, TripSession, RouteWeather, ConnectionRequest
-
+from bike_app.services import _haversine_km
 
 # ─── 1. Route Weather Serializer ──────────────────────────────────────────────
 class RouteWeatherSerializer(serializers.ModelSerializer):
@@ -118,7 +118,7 @@ class TripSessionSerializer(serializers.ModelSerializer):
         return []
 
     def get_convoy(self, obj):
-        from .services import _haversine_km
+        
 
         if not obj.bike_trip:
             return None
@@ -396,6 +396,8 @@ class BikeTripSerializer(serializers.ModelSerializer):
             'destination_coords',
             'specs',
             'created_at',
+            'depart_time',
+            'ride_pref',
         ]
         read_only_fields = ['id', 'user', 'created_at']
 
@@ -439,4 +441,4 @@ class BikeTripSerializer(serializers.ModelSerializer):
             'bikename': obj.bikename,
             'capacity': obj.capacity,
             'mileage': obj.mileage,
-        }
+        }
