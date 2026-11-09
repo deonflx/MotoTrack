@@ -41,6 +41,7 @@ from .services import (
     _haversine_km,
     _fetch_and_store_weather,
     _get_or_create_route_path,
+    calculate_compatibility,
 )
 
 User = get_user_model()
@@ -362,14 +363,36 @@ Provide a detailed advisory covering:
                     rider.destination_point.y, rider.destination_point.x
                 ), 2)
 
-            overlap = {'shared_km': 0.0, 'overlap_pct': 0.0, 'is_same_direction': False, 'is_match': False}
+            overlap = {
+                'shared_km': 0.0,
+                'overlap_pct': 0.0,
+                'overlap_pct_a': 0.0,
+                'overlap_pct_b': 0.0,
+                'is_same_direction': False,
+                'is_match': False,
+            }
             if trip.route_path and rider.route_path:
                 overlap = _calculate_route_overlap(trip, rider)
+            elif (trip.starting_point and trip.destination_point) and (rider.starting_point and rider.destination_point):
+                overlap = _calculate_route_overlap(trip, rider)
+
             is_dest_match = (dist_km is not None and dist_km <= radius_km) or (
                 dest_city and dest_city.lower() in (rider.destination_name or '').lower()
             )
 
-            if not (is_dest_match or overlap['is_match']):
+            # Match if there's corridor overlap OR matching destination
+            if not (is_dest_match or overlap.get('is_match')):
+                continue
+
+            compatibility = calculate_compatibility(
+                trip,
+                rider,
+                overlap,
+                dist_km
+            )
+
+            # Filter out trips with very low compatibility
+            if compatibility['compatibility_score'] < 35:
                 continue
 
             active_session = active_co_sessions.get(rider.pk)
@@ -384,12 +407,24 @@ Provide a detailed advisory covering:
                 'destination_name': rider.destination_name,
                 'dist_km': dist_km,
                 'shared_route_km': overlap['shared_km'],
-                'overlap_pct': overlap['overlap_pct'],
+                'overlap_pct': overlap.get('overlap_pct', 0.0),
+                'overlap_pct_a': overlap.get('overlap_pct_a', 0.0),
+                'overlap_pct_b': overlap.get('overlap_pct_b', 0.0),
                 'is_same_direction': overlap['is_same_direction'],
+                'compatibility_score': compatibility['compatibility_score'],
+                'compatibility_details': {
+                    'route': compatibility['route_score'],
+                    'direction': compatibility['direction_score'],
+                    'departure_time': compatibility['time_score'],
+                    'destination': compatibility['destination_score'],
+                    'riding_pace': compatibility['pace_score'],
+                },
                 'is_live': bool(active_session),
                 'live_session_id': active_session.pk if active_session else None,
             })
 
+        # Sort highest compatibility & live riders first
+        results.sort(key=lambda r: (not r['is_live'], -r['compatibility_score']))
         return Response(results)
 
 

@@ -109,7 +109,7 @@ def _calculate_route_overlap(trip_a: BikeTrip, trip_b: BikeTrip):
     path_b = trip_b.route_path or _get_or_create_route_path(trip_b)
 
     if not path_a or not path_b:
-        return {'shared_km': 0.0, 'overlap_pct': 0.0, 'is_same_direction': False, 'is_match': False}
+        return {'shared_km': 0.0, 'overlap_pct': 0.0, 'overlap_pct_a': 0.0, 'overlap_pct_b': 0.0, 'is_same_direction': False, 'is_match': False}
 
     try:
         # 1. Travel direction check (Dot product of start -> end vector)
@@ -162,21 +162,37 @@ def _calculate_route_overlap(trip_a: BikeTrip, trip_b: BikeTrip):
         for i in range(len(coords_a) - 1):
             total_a_km += _haversine_km(coords_a[i][1], coords_a[i][0], coords_a[i+1][1], coords_a[i+1][0])
 
-        overlap_pct = round((shared_km / total_a_km * 100), 1) if total_a_km > 0 else 0.0
-        overlap_pct = min(100.0, overlap_pct)
+        overlap_pct_a = round((shared_km / total_a_km * 100), 1) if total_a_km > 0 else 0.0
+        overlap_pct_a = min(100.0, overlap_pct_a)
 
-        # Significant match if shared route is >= 5km OR overlap >= 20% (with at least 2km)
-        is_match = (shared_km >= 5.0) or (overlap_pct >= 20.0 and shared_km >= 2.0)
+        total_b_km = 0.0
+        for i in range(len(coords_b) - 1):
+            total_b_km += _haversine_km(coords_b[i][1], coords_b[i][0], coords_b[i+1][1], coords_b[i+1][0])
+
+        overlap_pct_b = round((shared_km / total_b_km * 100), 1) if total_b_km > 0 else 0.0
+        overlap_pct_b = min(100.0, overlap_pct_b)
+
+        # Significant match if shared route is >= 5km OR overlap >= 20%
+        is_match = (shared_km >= 5.0) or (overlap_pct_a >= 20.0 and overlap_pct_b >= 20.0)
 
         return {
             'shared_km': shared_km,
-            'overlap_pct': overlap_pct,
+            'overlap_pct': overlap_pct_a,
+            'overlap_pct_a': overlap_pct_a,
+            'overlap_pct_b': overlap_pct_b,
             'is_same_direction': is_same_direction,
             'is_match': is_match,
         }
     except Exception as e:
         print(f"Error computing route overlap: {e}")
-        return {'shared_km': 0.0, 'overlap_pct': 0.0, 'is_same_direction': False, 'is_match': False}
+        return {
+            'shared_km': 0.0,
+            'overlap_pct': 0.0,
+            'overlap_pct_a': 0.0,
+            'overlap_pct_b': 0.0,
+            'is_same_direction': False,
+            'is_match': False,
+        }
 
 
 def _compute_refuel_point_and_pumps(starting_point, destination_point, capacity, mileage):
@@ -380,3 +396,100 @@ def _fetch_and_store_weather(trip: BikeTrip) -> str:
             print(f"Weather fetch failed for {label}:", e)
 
     return ' | '.join(descriptions) if descriptions else 'Weather unavailable'
+
+def calc_t_score(trip_a, trip_b):
+    t_a = getattr(trip_a, 'depart_time', None)
+    t_b = getattr(trip_b, 'depart_time', None)
+    if not t_a or not t_b:
+        return None
+    try:
+        diff = abs((t_a - t_b).total_seconds()) / 3600
+    except TypeError:
+        from django.utils import timezone
+        if timezone.is_aware(t_a) and timezone.is_naive(t_b):
+            t_b = timezone.make_aware(t_b)
+        elif timezone.is_naive(t_a) and timezone.is_aware(t_b):
+            t_a = timezone.make_aware(t_a)
+        diff = abs((t_a - t_b).total_seconds()) / 3600
+    except Exception:
+        return None
+
+    score = max(0.0, 100.0 - (diff / 6.0) * 100.0)
+    return round(score, 2)
+
+
+def calculate_destination_score(dist_km):
+    if dist_km is None:
+        return None
+
+    score = max(
+        0.0,
+        100.0 - (dist_km / 50.0) * 100.0
+    )
+
+    return round(score, 2)
+
+
+def calculate_pace_score(trip_a, trip_b):
+    pace_a = getattr(trip_a, 'ride_pref', None) or getattr(trip_a, 'riding_pace', None)
+    pace_b = getattr(trip_b, 'ride_pref', None) or getattr(trip_b, 'riding_pace', None)
+
+    if not pace_a or not pace_b:
+        return None
+
+    if pace_a == pace_b:
+        return 100.0
+
+    paces = ['relaxed', 'moderate', 'fast']
+    if pace_a in paces and pace_b in paces:
+        if abs(paces.index(pace_a) - paces.index(pace_b)) == 1:
+            return 50.0
+
+    return 0.0
+
+
+def calculate_compatibility(trip_a, trip_b, overlap, dist_km):
+    # Route overlap score based on overlap % of routes
+    pct_a = overlap.get('overlap_pct_a', 0.0)
+    pct_b = overlap.get('overlap_pct_b', 0.0)
+    route_score = min(100.0, 2.0 * min(pct_a, pct_b))
+
+    direction_score = 100.0 if overlap.get('is_same_direction') else 0.0
+    destination_score = calculate_destination_score(dist_km)
+    time_score = calc_t_score(trip_a, trip_b)
+    pace_score = calculate_pace_score(trip_a, trip_b)
+
+    components = [
+        (route_score, 40),
+        (direction_score, 20),
+        (time_score, 15),
+        (destination_score, 15),
+        (pace_score, 10),
+    ]
+
+    available = [
+        (score, weight)
+        for score, weight in components
+        if score is not None
+    ]
+
+    total_weight = sum(
+        weight for score, weight in available
+    )
+
+    if total_weight > 0:
+        final_score = sum(
+            score * weight
+            for score, weight in available
+        ) / total_weight
+    else:
+        final_score = 0.0
+
+    return {
+        'compatibility_score': round(final_score, 1),
+        'route_score': round(route_score, 1),
+        'direction_score': direction_score,
+        'time_score': time_score,
+        'destination_score': destination_score,
+        'pace_score': pace_score,
+    }
